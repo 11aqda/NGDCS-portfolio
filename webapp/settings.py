@@ -117,7 +117,7 @@ REDIS = {
 LEADERBOARD_KEY = "lb:best_score"
 
 # Web 读游戏端每秒写出的指标。
-# 默认读本工作区 data/；论文工作区跑服务端时用环境变量指过去（14 ）。
+# 默认读本工作区的 data/；换工作区跑服务端时用环境变量指过去。
 METRICS_CSV = Path(
     os.environ.get("NGDCS_METRICS_CSV") or BASE_DIR / "data" / "server_metrics.csv"
 )

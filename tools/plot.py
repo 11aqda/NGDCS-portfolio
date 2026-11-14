@@ -377,7 +377,7 @@ def plot_e1(
                 "snapshot_bytes", "平均快照大小 (字节)", "图 6-1 二进制 vs JSON 包大小",
                 "fig6-01-encoder-snapshot-size.png",
                 lambda p: f"{p['snapshot_bytes']:.0f} B",
-                # 图注要把口径钉死，否则答辩时说不清这根柱子到底量了什么
+                # 图注要把口径写清楚，读者才知道这根柱子量的是什么
                 # （matplotlib 不认 Markdown，别在图上写 号）
                 f"口径：快照载荷（不含 12 B 帧头）；{ref_enemies} 敌机 / {ref_bullets} 子弹、"
                 f"无道具；JSON = list[dict] + separators=(',',':') + ensure_ascii=False",
@@ -1088,7 +1088,7 @@ def main() -> None:
             f"  CPU 偏差 {cpu_gap:5.1f}%{mark}"
         )
     if flagged:
-        print(f"  → {flagged} 个档位偏差超过 {AGREEMENT_TOLERANCE_PERCENT:.0f}%，先别急着写进论文")
+        print(f"  → {flagged} 个档位偏差超过 {AGREEMENT_TOLERANCE_PERCENT:.0f}%，先别急着下结论")
     else:
         print("  → 全部在容差内，可作正式数据")
 

@@ -18,6 +18,10 @@
 
 ![游戏画面](docs/screenshots/03-game.png)
 
+| 登录界面 | 游戏模式 |
+|---|---|
+| ![登录](docs/screenshots/01-login.png) | ![游戏模式](docs/screenshots/game-mode.png) |
+
 ![排行榜](docs/screenshots/04-leaderboard.png)
 
 ---
@@ -62,32 +66,43 @@
 - MySQL 8（库 `myproject`，用户 `django_user`）
 - Redis 5+（可选：排行榜与实时指标；没有也能跑，看板回退 CSV）
 
+MySQL 初始化（只做一次）：
+
+```sql
+CREATE DATABASE myproject CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'django_user'@'localhost' IDENTIFIED BY '你的密码';
+GRANT ALL PRIVILEGES ON myproject.* TO 'django_user'@'localhost';
+```
+
 ### 启动
 
 ```powershell
 cd NGDCS-portfolio
 
+# 0) 虚拟环境（建议；之后用 .\.venv\Scripts\python.exe 执行下面所有命令）
+python -m venv .venv
+
 # 1) 依赖（务必带镜像源）
-python -m pip install -r requirements.txt `
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt `
     -i https://pypi.tuna.tsinghua.edu.cn/simple --no-cache-dir --progress-bar off
 
-# 2) 配置：复制 .env.example 为 .env，填随机 SECRET_KEY 和本地 MySQL 密码
+# 2) 配置：复制 .env.example 为 .env，填 SECRET_KEY 和 NGDCS_DB_PASSWORD
 copy .env.example .env
 
 # 3) 建表
-python manage.py migrate
+.\.venv\Scripts\python.exe manage.py migrate
 
 # 4) 管理员（或直接灌演示数据，见下）
-python manage.py createsuperuser
+.\.venv\Scripts\python.exe manage.py createsuperuser
 
 # 5) Django
-python manage.py runserver 127.0.0.1:8000
+.\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000
 
 # 6) 游戏服务端（另开窗口）
-python -X utf8 -m server.main --game-mode --persist-scores
+.\.venv\Scripts\python.exe -X utf8 -m server.main --game-mode --persist-scores
 
 # 7) 客户端（另开窗口）
-python -X utf8 -m client.main
+.\.venv\Scripts\python.exe -X utf8 -m client.main
 ```
 
 打开 <http://127.0.0.1:8000/dashboard/>，用管理员账号登录。
@@ -111,17 +126,17 @@ python manage.py seed_demo
 ## 测试
 
 ```powershell
-# 主测试（协议 / 服务端 / 机器人 / 指标 / 实验回归）
-python -X utf8 -m unittest discover -s tests
+# 主测试（协议 / 服务端 / 机器人 / 指标 / 采集回归）
+.\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests
 
 # Django 测试（账号 / 看板 / DRF / 演示数据）
-python manage.py test accounts dashboard --noinput
+.\.venv\Scripts\python.exe manage.py test accounts dashboard --noinput
 
-# 黄金基线（默认实验路径的 SHA256 锁）
-python -X utf8 -m unittest tests.test_golden_baseline
+# 黄金基线（快照逐字节 SHA256 校验）
+.\.venv\Scripts\python.exe -X utf8 -m unittest tests.test_golden_baseline
 
-# 实验回归（硬 13 + 软 11）
-python -X utf8 -m tools.check_experiments
+# 采集回归（24 项：字节布局、帧解析、短跑验证）
+.\.venv\Scripts\python.exe -X utf8 -m tools.check_experiments
 ```
 
 ```text
@@ -159,7 +174,7 @@ bot/         压测机器人
 accounts/    用户、token、成绩、排行榜、DRF 只读接口、seed_demo
 dashboard/   看板视图与模板
 webapp/      Django 配置与路由
-tools/       实验跑批、出图、回归检查、录屏
+tools/       压测、出图、回归检查、录屏
 tests/       主测试与黄金基线
 deploy/      nginx 配置、容器入口脚本
 docs/        架构图、截图、演示 GIF
