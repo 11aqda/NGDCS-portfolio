@@ -1,0 +1,522 @@
+"""pygame 客户端 + 实体渲染。"""
+
+import argparse
+import os
+import sys
+import time
+
+import pygame
+
+from client.background import Starfield, draw_nebula
+from client.board import run_board_screen
+from client.login import LoginScreen, authenticate
+from client.fonts import load_font
+from client.net import NetworkClient
+from client.sprites_game import draw_enemy_by_type
+from client.sprites import (
+    Explosion,
+    draw_enemy_bullet,
+    draw_enemy_ship,
+    draw_player_bullet,
+    draw_player_ship,
+)
+from protocol.framing import ProtocolError
+from protocol.messages import (
+    C_HEARTBEAT,
+    C_INPUT,
+    KEY_FIRE,
+    KEY_LEFT,
+    KEY_RIGHT,
+    S_HEARTBEAT_ACK,
+    S_SNAPSHOT,
+    S_WELCOME,
+    C_AUTH,
+    S_AUTH_OK,
+    S_AUTH_FAIL,
+    pack_auth,
+    unpack_auth_ok,
+    WELCOME,
+    now_ms,
+    pack_heartbeat,
+    pack_keys,
+    rtt_ms,
+    unpack_heartbeat_ack,
+)
+from protocol.interp import clamp_alpha
+from protocol.snapshot import unpack_snapshot
+from protocol.world import WORLD_HEIGHT, WORLD_WIDTH
+
+FPS = 60
+INPUT_INTERVAL = 0.05  # 20 Hz，与 tick 同频（定频发送，天然冗余）
+HEARTBEAT_INTERVAL = 5.0  # 02
+
+BG = (16, 20, 32)
+GRID = (30, 36, 52)
+TEXT = (220, 226, 240)
+DIM_TEXT = (120, 132, 156)  # HUD 的次要信息（tick / 连接状态）
+WHITE = (255, 255, 255)
+RED = (255, 120, 120)
+
+# ---------------------------------------------------------------- 颜色语义
+# 整屏乱不乱，就靠这一条规则：
+#     冷色（青 / 蓝 / 绿） = 我方
+#     暖色（红 / 橙）      = 敌方
+#     金色                 = 分数（全屏唯一的中性强调色）
+#
+# 2026-11-01 之前是反着来的：我方子弹浅青、敌方子弹橙黄，而分数也是暖金色，
+# 屏幕上到处是亮点，分不清谁打谁。定下这条规则后，颜色本身就带语义
+# 不需要看清形状也知道该躲什么。
+ENEMY_BODY = (255, 88, 88)       # 敌机主体：正红
+ENEMY_EDGE = (150, 40, 40)       # 敌机描边：让三角从背景里立起来
+ENEMY_BULLET_COLOR = (255, 110, 70)   # 敌方子弹：橙红，朝我飞
+PLAYER_BULLET_COLOR = (120, 235, 255)  # 我方子弹：亮青，向上
+BANNER_COLOR = (255, 236, 170)   # 波次提示：暖金，与分数同色系但不抢眼
+SCORE_COLOR = (255, 214, 102)    # 分数：金
+SELF_RING = (255, 255, 255)      # 本机描边
+
+# 8 个玩家颜色全部取冷色/中性色 —— 玩家绝不能出现红橙
+# 否则和敌机撞色（协议里 color 是 3 bit，但"用哪 8 种"是显示层自由）
+PALETTE = [
+    (54, 162, 235),    # 蓝
+    (75, 192, 192),    # 青绿
+    (83, 255, 150),    # 绿
+    (153, 102, 255),   # 紫
+    (0, 200, 255),     # 亮青
+    (100, 220, 255),   # 浅蓝
+    (140, 255, 200),   # 薄荷
+    (199, 199, 199),   # 中性灰
+]
+
+
+def lerp(a: float, b: float, t: float) -> float:
+    """线性插值：t=0 返回 a，t=1 返回 b。"""
+    return a + (b - a) * t
+
+
+def draw_grid(screen: pygame.Surface, width: int, height: int) -> None:
+    for x in range(0, width + 1, 80):
+        pygame.draw.line(screen, GRID, (x, 0), (x, height))
+    for y in range(0, height + 1, 80):
+        pygame.draw.line(screen, GRID, (0, y), (width, y))
+
+
+def read_keys() -> int:
+    """把键盘状态翻译成协议里的输入位掩码（02 ）。"""
+    pressed = pygame.key.get_pressed()
+    keys = 0
+    if pressed[pygame.K_LEFT] or pressed[pygame.K_a]:
+        keys |= KEY_LEFT
+    if pressed[pygame.K_RIGHT] or pressed[pygame.K_d]:
+        keys |= KEY_RIGHT
+    # 空格 = 请求开火，不是"我来生成子弹"。
+    # 真正能不能打出来由服务端的射速（player_cd）决定（边界 1）。
+    if pressed[pygame.K_SPACE]:
+        keys |= KEY_FIRE
+    return keys
+
+
+def parse_args() -> argparse.Namespace:
+    """位置参数保持老用法：`client.main 127.0.0.1 9527`（向后兼容）。"""
+    parser = argparse.ArgumentParser(description="NGDCS 客户端（pygame）")
+    parser.add_argument("host", nargs="?", default="127.0.0.1")
+    parser.add_argument("port", nargs="?", type=int, default=9527)
+    parser.add_argument(
+        "--api",
+        default="http://127.0.0.1:8000",
+        help="HTTP 认证 / 排行榜服务地址（Django）",
+    )
+    parser.add_argument(
+        "--guest",
+        action="store_true",
+        help="跳过登录界面，以游客身份直接进游戏（不参与排行榜）",
+    )
+    parser.add_argument(
+        "--login",
+        metavar="USER:PASS",
+        default="",
+        help="免交互登录（自动化 / 录屏 / 截图用）：走和登录界面同一条 HTTP 路径",
+    )
+    parser.add_argument(
+        "--shot",
+        default="",
+        help="在 --shot-after 秒时把当前画面存成 PNG（截图取证用）。"
+        "由客户端自己 pygame.image.save 保存，不走屏幕截屏 —— "
+        "不受窗口遮挡 / DPI 缩放 / 多窗口影响（那些坑都踩过）",
+    )
+    parser.add_argument(
+        "--shot-after", type=float, default=30.0, help="--shot 在第几秒保存，默认 30"
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    host, port, api_base = args.host, args.port, args.api
+
+    # 让窗口居中：不设这个，Windows 会把 720×960 的窗口甩到屏幕右下角
+    # 高 DPI 缩放下右下两边都会被裁掉（实测玩家方块和 SCORE 都看不见了）
+    os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
+
+    # 先声明 DPI 感知：Windows 在 125%/150% 缩放下，不声明的话
+    # pygame 报告的屏幕尺寸与实际可用的像素不是一个坐标体系，
+    # 按它算出来的窗口会超出屏幕（实测右侧 SCORE 被裁掉）。
+    # 声明之后逻辑像素 == 物理像素，下面的比例计算才准。
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+    except Exception:  # noqa: BLE001 - 非 Windows 或旧系统上忽略
+        pass
+
+    pygame.init()
+    info = pygame.display.Info()
+
+    # 按屏幕的 85% 等比缩放，保证标题栏 + 窗口完整放得下。
+    # pygame 的 current_w/h 是逻辑像素，150% 缩放下实际占屏会是 1.5 倍
+    # 所以不能只判"高度够不够 1000"，得按比例算。
+    # 画面比例：竖版 3:4 在宽屏上会显得"太长"（用户反馈"上下长了点"）。
+    # 竖直方向压到 88%，窗口因此略宽、略短。
+    # 世界坐标（720x960）完全不动 —— 只改渲染时的横纵缩放比。
+    # 这个游戏只有左右移动，竖直压缩 12% 的观感影响极小。
+    SHORTEN = 0.88
+    avail_w = int(info.current_w * 0.95)
+    avail_h = int(info.current_h * 0.88)
+    height = min(avail_h, int(avail_w * WORLD_HEIGHT / WORLD_WIDTH / SHORTEN))
+    height = max(426, height)
+    width = max(320, int(height * WORLD_WIDTH / WORLD_HEIGHT / SHORTEN))
+    scale_x = width / WORLD_WIDTH
+    scale_y = height / WORLD_HEIGHT
+
+    screen = pygame.display.set_mode((width, height))
+    # 三层视差星空。纯客户端表现，不碰协议。
+    starfield = Starfield(width, height, seed=7)
+    pygame.display.set_caption("C/S 实时通信 · 输入 + 心跳 + 实体")
+    clock = pygame.time.Clock()
+    shot_started = time.perf_counter()
+    shot_taken = False
+    # 击中反馈：自己比较前后两帧的 hp，不需要协议支持
+    enemy_hp: dict[int, int] = {}
+    enemy_flash: dict[int, float] = {}  # enemy_id -> 闪白结束时刻
+    font = load_font(18)
+    big_font = load_font(24, bold=True)
+    wave_font = load_font(max(28, int(width * 0.055)), bold=True)
+
+    # ---- 先登录（HTTP），拿到 token 再连 TCP ----
+    # 这就是长短连接分层的现场：登录走 HTTP、对局走 TCP，token 是两者的接口。
+    token, username = "", "游客"
+    if args.login:
+        # 免交互登录：自动化和截图场景用。和登录界面走同一个 `authenticate`
+        # 不存在"绕过认证"的旁路。
+        user, _, password = args.login.partition(":")
+        try:
+            token, username = authenticate(api_base, user, password)
+            print(f"[client] --login 成功：{username}")
+        except ValueError as exc:
+            print(f"[client] --login 失败（{exc}），以游客身份进入")
+            token, username = "", "游客"
+    elif not args.guest:
+        result = LoginScreen(screen, font, big_font, api_base).run()
+        if result is None:
+            pygame.quit()
+            return
+        token, username = result
+    print(f"[client] 登录身份：{username}"
+          + ("（游客，不参与排行榜）" if not token else "（已认证，将参与排行榜）"))
+
+    try:
+        net = NetworkClient(host, port)
+    except OSError as exc:
+        print(f"[client] connect failed: {exc}")
+        pygame.quit()
+        return
+
+    # ---- TCP 层认证：把 HTTP 拿到的 token 交给服务端 ----
+    auth_state = "guest"
+    if token:
+        net.send(C_AUTH, pack_auth(token))
+        auth_state = "pending"
+
+    print(f"[client] connected to {host}:{port}; window {width}x{height}")
+    print("[client] ←/→ 或 A/D 移动；B 看排行榜；ESC 退出")
+
+    my_id = 0
+    tick = 0
+    prev: dict = {}
+    curr: dict = {}
+    prev_arrived_at = 0.0   # 上一帧快照的到达时刻（插值分母用）
+    curr_arrived_at = 0.0   # 当前帧快照的到达时刻
+    wave = 1
+    wave_state = 0
+    enemies: tuple = ()
+    bullets: tuple = ()
+    prev_enemies: tuple = ()   # 上一帧敌机，用来推断"哪一架被打掉了"
+    curr_enemy_ids: set[int] = set()
+    explosions: list[Explosion] = []   # 纯客户端的击杀特效
+    keys = 0
+    last_rtt = 0.0
+    inputs_sent = 0
+    heartbeats_sent = 0
+    heartbeats_acked = 0
+    running = True
+
+    now = time.perf_counter()
+    next_input_at = now
+    next_heartbeat_at = now
+
+    try:
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_b:
+                    # 排行榜是低频请求-响应数据（ 的分层理由）
+                    # 点开才拉一次，不挂在 20 Hz 循环里
+                    if run_board_screen(screen, font, big_font, api_base,
+                                        username) == "quit":
+                        running = False
+
+            # 1) 非阻塞收包：这一帧能收多少收多少
+            for frame in net.poll():
+                if frame.msg_type == S_WELCOME and len(frame.payload) == WELCOME.size:
+                    my_id, _color = WELCOME.unpack(frame.payload)
+                elif frame.msg_type == S_AUTH_OK:
+                    # 服务端确认认证通过：回带 player_id + 昵称。
+                    # 认证失败不影响继续玩，只是不参与排行榜。
+                    try:
+                        auth_id, auth_name = unpack_auth_ok(frame.payload)
+                        my_id = auth_id
+                        auth_state = "ok"
+                        print(f"[client] 认证通过：player {auth_id} ({auth_name})")
+                    except ProtocolError as exc:
+                        print(f"[client] S_AUTH_OK 解析失败：{exc}")
+                elif frame.msg_type == S_AUTH_FAIL:
+                    auth_state = "failed"
+                    print("[client] 认证失败（token 无效），将以匿名身份继续")
+                elif frame.msg_type == S_SNAPSHOT:
+                    try:
+                        snapshot = unpack_snapshot(frame.payload)
+                    except ProtocolError as exc:
+                        print(f"[client] protocol error: {exc}")
+                        running = False
+                        break
+
+                    prev = dict(curr)
+                    curr = {p.player_id: p for p in snapshot.players}
+                    # 实体直接取最近一帧，不参与插值（原因见模块开头）
+                    prev_enemies = enemies
+                    enemies = snapshot.enemies
+                    _now = time.perf_counter()
+                    for _e in enemies:
+                        _old = enemy_hp.get(_e.enemy_id)
+                        # hp 变小 = 这一帧打中了 → 闪白 0.1 秒
+                        if _old is not None and _e.hp < _old:
+                            enemy_flash[_e.enemy_id] = _now + 0.10
+                        enemy_hp[_e.enemy_id] = _e.hp
+                    # 清理已消失的敌机，避免 dict 无限增长
+                    if len(enemy_hp) > len(enemies) * 2 + 16:
+                        _alive = {e.enemy_id for e in enemies}
+                        for _k in [k for k in enemy_hp if k not in _alive]:
+                            enemy_hp.pop(_k, None)
+                            enemy_flash.pop(_k, None)
+                    curr_enemy_ids = {e.enemy_id for e in enemies}
+                    bullets = snapshot.bullets
+                    # 记住两帧各自的到达时刻：插值系数要用真实间隔算
+                    # 不能用写死的 1/20 秒（见下面 alpha 处的长注释）
+                    prev_arrived_at = curr_arrived_at
+                    curr_arrived_at = time.perf_counter()
+                    tick = snapshot.tick
+                    # 波次信息：wave_state == 1 表示"波间提示中"（服务端在停顿期间置 1）
+                    wave = snapshot.wave
+                    wave_state = snapshot.wave_state
+                elif frame.msg_type == S_HEARTBEAT_ACK:
+                    client_time, _server_time = unpack_heartbeat_ack(frame.payload)
+                    # 回显的 client_time 是我们自己写的，所以 RTT 不需要两端对表
+                    last_rtt = rtt_ms(client_time) / 1000.0
+                    heartbeats_acked += 1
+
+            # 2) 计算插值系数 alpha ∈ [0, 1]，分母是两帧的实际到达间隔
+            #
+            # 这里曾经写死 `TICK_INTERVAL = 0.05`（= 20 Hz 的间隔），是个真 bug：
+            #
+            #   tick 率 30 Hz 时：真实间隔 33 ms，但 alpha 按 50 ms 算 → 到 33 ms 才 0.67，
+            # 下一帧就到了，画面永远跟不上、看起来像在"拖影"
+            #   tick 率 10 Hz 时：真实间隔 100 ms，alpha 在 50 ms 就到 1.0 并钳住
+            # → 后 50 ms 画面冻住，然后跳一下
+            #   网络有抖动时：相邻间隔忽大忽小，用固定值算的 alpha 与真实节奏完全不匹配
+            #
+            # E4/E5 两次实验已经把这个问题量出来了（err_px 随抖动、随 tick 率变化），
+            # 现在按实际间隔算，才是那两章结论所描述的那个算法。
+            #
+            # 复用 `protocol/interp.py` 的 `clamp_alpha`：测量和渲染必须是同一个公式
+            # 否则"实验测到的误差"和"玩家看到的画面"就是两回事。
+            now = time.perf_counter()
+            if curr:
+                alpha = clamp_alpha(now, prev_arrived_at, curr_arrived_at)
+            else:
+                alpha = 0.0
+
+            # 3) 定频上报输入 + 定时心跳（都是「排进队列」，真正的发送在下一帧 poll）
+            #
+            # 用「deadline 累加」（next += 间隔）而不是「now + 间隔」：
+            # 后者会把上报频率量化到帧率上（60 fps 下 50 ms 不是 16.7 ms 的整数倍，
+            # 实测只有约 17 次/秒），前者平均频率准，而且每个渲染帧最多补发一帧，
+            # 不会因为卡顿而突发。服务端的 tick_loop 用的是同一个模式。
+            keys = read_keys()
+            if net.connected and now >= next_input_at:
+                net.send(C_INPUT, pack_keys(keys))
+                inputs_sent += 1
+                next_input_at += INPUT_INTERVAL
+
+            if net.connected and now >= next_heartbeat_at:
+                net.send(C_HEARTBEAT, pack_heartbeat(now_ms()))
+                heartbeats_sent += 1
+                next_heartbeat_at += HEARTBEAT_INTERVAL
+
+            # 4) 绘制
+            screen.fill(BG)
+            # 背景：星云垫底 + 三层视差星空（用户反馈背景太单调）
+            draw_nebula(screen, width, height)
+            starfield.update(1.0 / FPS)
+            starfield.draw(screen)
+            draw_grid(screen, width, height)
+
+            # 子弹：两种子弹用不同形状，不只靠颜色 ——
+            # 我方子弹是发光竖条（一眼看出"往上打"），敌方子弹是圆点（一眼看出"朝我来"）。
+            #
+            # 子弹不做插值：子弹条目没有唯一 ID（只有 owner_id）
+            # 客户端无法把这一帧的子弹和上一帧的对应起来（见 protocol/snapshot.py）。
+            # 这是协议设计的结果，不是漏做 —— 要平滑只能靠外推或延迟快照缓冲。
+            # 子弹放大一半（用户要求）：3/12 -> 5/20，敌方弹丸 3 -> 4
+            bar_w = max(3, int(5 * min(scale_x, scale_y)))
+            bar_h = max(10, int(20 * min(scale_x, scale_y)))
+            dot_r = max(3, int(4 * min(scale_x, scale_y)))
+            for bullet in bullets:
+                bx = int(bullet.x * scale_x)
+                by = int(bullet.y * scale_y)
+                if bullet.owner_id:
+                    draw_player_bullet(screen, bx, by, bar_w, bar_h)
+                else:
+                    draw_enemy_bullet(screen, bx, by, dot_r)
+
+            # 敌机：矢量的"倒飞小飞机"（机体 + 两翼 + 描边 + 座舱点）。
+            # 占位阶段敌机统一向下飞（协议里没有 angle 字段，方向由 type 隐含），
+            # 所以形状固定朝下是对的；按 type 分形状/配色属于游戏内容。
+            enemy_size = max(26, int(58 * min(scale_x, scale_y)))  # 26 → 30：用户反馈判定体偏小，视觉也一起放大
+            for enemy in enemies:
+                # 按 enemy.type 区分形状。未知类型回落到占位形状。
+                draw_enemy_by_type(
+                    screen,
+                    int(enemy.x * scale_x),
+                    int(enemy.y * scale_y),
+                    enemy_size,
+                    enemy.type,
+                    ENEMY_BODY,
+                    enemy.hp,
+                    flash=now < enemy_flash.get(enemy.enemy_id, 0.0),
+                )
+
+            # 击杀爆炸：纯客户端表现。靠"上一帧有、这一帧没了、且消失位置在屏幕中部"
+            # 推断是被打掉了 —— 飞出屏幕底部的不算（那是正常移出画面）。
+            for enemy in prev_enemies:
+                if enemy.enemy_id in curr_enemy_ids:
+                    continue
+                if enemy.y < WORLD_HEIGHT - 60:  # 不是在底边正常出屏
+                    explosions.append(
+                        Explosion(enemy.x * scale_x, enemy.y * scale_y)
+                    )
+            for boom in explosions:
+                boom.update(1.0 / FPS)
+                boom.draw(screen, max(8, int(18 * min(scale_x, scale_y))))
+            explosions[:] = [b for b in explosions if not b.done]
+
+            for player_id, player in curr.items():
+                old = prev.get(player_id, player)
+                x = lerp(old.x, player.x, alpha) * scale_x
+                y = lerp(old.y, player.y, alpha) * scale_y
+
+                color = PALETTE[player.color % len(PALETTE)]
+                size = max(40, int(78 * min(scale_x, scale_y)))
+                draw_player_ship(
+                    screen, int(x), int(y), size, color,
+                    is_self=(player_id == my_id), t=pygame.time.get_ticks() / 1000.0,
+                )
+
+                label = font.render(f"P{player_id}", True, TEXT)
+                # 标签挂在机头上方（玩家绘制不再有 rect，直接按中心点算）
+                screen.blit(
+                    label,
+                    (int(x) - label.get_width() // 2, int(y) - size // 2 - 24),
+                )
+
+            # 5) HUD：keys 显示你现在按住了什么，rtt 显示心跳往返耗时
+            # 分数由服务端算好放在快照里（击杀生效后，），客户端只读不算 ——
+            # 客户端没有任何分数上报接口，这是防作弊的设计约束
+            #
+            # 排版踩过坑：加上 `[用户名]` 之后第一行变太长，`fps` 直接撞到右上角
+            # 的大号 `SCORE`（实测显示成 "fpsSCORE 10"），`connected` 也压在第 2 行上。
+            # 现在按"每行各管一摊"重排：第 1 行身份/实体、第 2 行输入/延迟/帧率、
+            # 第 3 行 tick 与连接状态，右上角那行只留给 SCORE。
+            my_score = curr[my_id].score if my_id in curr else 0
+            hud_line1 = (
+                f"players={len(curr)}  you=P{my_id}  [{username}]  "
+                f"e/b={len(enemies)}/{len(bullets)}"
+            )
+            hud_line2 = (
+                f"keys={keys:02b}  rtt={last_rtt * 1000:.2f}ms  "
+                f"in={inputs_sent}  hb={heartbeats_acked}/{heartbeats_sent}  "
+                f"fps={clock.get_fps():.0f}"
+            )
+            screen.blit(font.render(hud_line1, True, TEXT), (12, 10))
+            screen.blit(font.render(hud_line2, True, TEXT), (12, 34))
+
+            # 分数单独放大显示：这是唯一"玩起来有反馈"的数字
+            if my_id in curr:
+                score_text = big_font.render(f"SCORE {curr[my_id].score}", True, SCORE_COLOR)
+                screen.blit(score_text, (width - score_text.get_width() - 12, 8))
+
+            state = "connected" if net.connected else f"disconnected: {net.last_error}"
+            state_text = f"tick={tick}  {state}"
+            screen.blit(font.render(state_text, True, DIM_TEXT), (12, 58))
+
+            if not curr:
+                waiting = big_font.render("waiting for snapshot...", True, TEXT)
+                screen.blit(waiting, waiting.get_rect(center=(width // 2, height // 2)))
+
+            if not net.connected:
+                text = big_font.render("disconnected - ESC to quit", True, RED)
+                screen.blit(text, text.get_rect(center=(width // 2, height // 2 + 40)))
+
+            # 波间提示：服务端在停顿期间 wave_state = 1，这里播一行大字。
+            # 敌机一出来（wave_state 回 0）它就消失 —— 用户要的"出来就消失"。
+            if wave_state == 1:
+                banner = wave_font.render(f"第 {wave} 波", True, BANNER_COLOR)
+                shadow = wave_font.render(f"第 {wave} 波", True, (0, 0, 0))
+                rect = banner.get_rect(center=(width // 2, height // 2 - 40))
+                screen.blit(shadow, rect.move(3, 3))
+                screen.blit(banner, rect)
+                hint = font.render("准备…", True, DIM_TEXT)
+                screen.blit(
+                    hint, hint.get_rect(center=(width // 2, height // 2 + 20)),
+                )
+
+            pygame.display.flip()
+
+            # 截图取证：由客户端自己保存这一帧画面。
+            # 不走 PowerShell 屏幕截屏 —— 那条路要处理窗口遮挡、DPI 缩放、
+            # 控制台抢窗，全是坑（之前 7 张截图踩遍了）。这里直接拿 surface，干净。
+            if args.shot and not shot_taken:
+                if time.perf_counter() - shot_started >= args.shot_after:
+                    pygame.image.save(screen, args.shot)
+                    shot_taken = True
+                    print(f"[client] 已保存画面：{args.shot}")
+
+            clock.tick(FPS)
+    finally:
+        net.close()
+        pygame.quit()
+
+
+if __name__ == "__main__":
+    main()

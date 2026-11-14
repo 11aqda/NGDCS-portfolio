@@ -1,0 +1,206 @@
+"""消息类型与固定格式的载荷。"""
+
+import struct
+import time
+
+from protocol.framing import ProtocolError
+
+ECHO = 0x7F
+S_WELCOME = 0x7C
+S_SNAPSHOT = 0x84
+
+C_INPUT = 0x06
+C_HEARTBEAT = 0x07
+S_HEARTBEAT_ACK = 0x87
+
+# ---- 认证----
+# 这是「长短连接分层」唯一的衔接点：
+# 客户端先走 HTTP 登录拿到 token，再在 TCP 连接上用它认证。
+C_AUTH = 0x01
+S_AUTH_OK = 0x81
+S_AUTH_FAIL = 0x82
+
+# 失败码（02 ）
+ERR_AUTH_FAILED = 0x01
+
+# C_AUTH 载荷：version uint8 + token（变长 ASCII，1~64 字节）
+#   token 是 HTTP 登录返回的 64 位十六进制串。用变长而不是定长，
+#   是为了将来缩短/换格式时不用改协议版本。
+AUTH_HEADER = struct.Struct("!B")
+TOKEN_MIN, TOKEN_MAX = 1, 64
+
+# S_AUTH_OK 载荷：player_id uint16 + nickname_len uint8 + nickname（UTF-8，1~20 字节）
+AUTH_OK_HEADER = struct.Struct("!HB")
+NICKNAME_MIN, NICKNAME_MAX = 1, 20
+
+# S_AUTH_FAIL 载荷：code uint8
+AUTH_FAIL = struct.Struct("!B")
+
+# S_WELCOME 载荷：player_id uint16 + color uint8
+WELCOME = struct.Struct("!HB")
+
+# C_INPUT 载荷：keys uint8（位掩码，见 02 ）
+INPUT = struct.Struct("!B")
+
+# C_HEARTBEAT 载荷：client_time uint32（毫秒）
+HEARTBEAT = struct.Struct("!I")
+
+# S_HEARTBEAT_ACK 载荷：client_time uint32 + server_time uint32
+HEARTBEAT_ACK = struct.Struct("!II")
+
+# 输入位掩码（02 ）：bit 0 左、bit 1 右，bit 2~7 保留。
+# 业务层只认 KEYS_MASK 里的位，其余一律掩掉 —— 这样将来加「上下移动」（bit 2）时，
+# 旧服务端不会因为不认识新位就断连接（前向兼容）。
+KEY_LEFT = 0x01
+KEY_RIGHT = 0x02
+# 移动位的集合。只有 LEFT|RIGHT 两位 —— 与之前完全一致
+# `movement.keys_to_dx()` 用它把其余位掩掉。开火位故意不并进来（见下）。
+KEYS_MASK = KEY_LEFT | KEY_RIGHT
+# 开火位。故意不并进 KEYS_MASK：
+#   · KEYS_MASK 是"移动位"的集合，`movement.keys_to_dx()` 用它把其余位掩掉；
+# · 开火是另一个语义（请求服务端开火，不是移动），混进去会让
+#     `keys_to_dx` 的输入口径变味；
+#   · 而且 `tests/test_input.py` 明确断言 `KEYS_MASK == 0b11`。
+# 服务端直接读 `client.keys & KEY_FIRE`，载荷仍是 1 B（uint8），长度不变。
+KEY_FIRE = 0x04
+
+# 实体类型（02 ）。这里只定义当前用到的值，完整表见文档。
+ENEMY_DIVE = 0x01  # 直线俯冲（占位实体用的就是它）
+ENEMY_WEAVE = 0x02  # 横向移动：落到固定高度后左右来回
+ENEMY_TRACK = 0x03  # 追踪玩家：缓慢横移靠拢（不加速）
+ENEMY_BOSS = 0xFF  # BOSS —— 用来推导快照头的 boss_present 标志
+
+BULLET_PLAYER_L1 = 0x01  # 玩家 Lv1 子弹
+BULLET_ENEMY_SPREAD = 0x11  # 敌方直线散射弹
+BULLET_ENEMY_FAN = 0x12  # 敌方扇形弹（3 发）
+BULLET_ENEMY_HOMING = 0x13  # 敌方追踪弹（朝目标方向）
+
+ITEM_POWER = 0x01  # 火力道具
+
+# 角度基准（02 ）：0° = 正上方，顺时针增加。
+# 竖版飞机大战「向上」是主方向，所以 0 放在正上而不是数学习惯的正右。
+ANGLE_UP = 0
+ANGLE_RIGHT = 64
+ANGLE_DOWN = 128
+ANGLE_LEFT = 192
+
+_TIME_MASK = 0xFFFFFFFF
+
+
+def _require_size(payload: bytes, layout: struct.Struct, name: str) -> None:
+    """载荷必须正好是这么多字节，多一字节少一字节都是协议错误。"""
+    if len(payload) != layout.size:
+        raise ProtocolError(
+            f"{name} 载荷长度错误：{len(payload)} B != {layout.size} B"
+        )
+
+
+def now_ms() -> int:
+    """单调时钟的毫秒时间戳，取低 32 位。"""
+    return int(time.monotonic() * 1000) & _TIME_MASK
+
+
+def rtt_ms(sent_ms: int, now: int | None = None) -> int:
+    """用无符号差值算 RTT（毫秒），天然容忍 32 位回绕。"""
+    if now is None:
+        now = now_ms()
+    return (now - sent_ms) & _TIME_MASK
+
+
+def pack_keys(keys: int) -> bytes:
+    if not 0 <= keys <= 0xFF:
+        raise ProtocolError(f"keys 超出 uint8：{keys}")
+    return INPUT.pack(keys)
+
+
+def unpack_keys(payload: bytes) -> int:
+    """解析 C_INPUT 载荷，返回原始位掩码（不掩保留位）。"""
+    _require_size(payload, INPUT, "C_INPUT")
+    return INPUT.unpack(payload)[0]
+
+
+def pack_heartbeat(client_time: int) -> bytes:
+    if not 0 <= client_time <= _TIME_MASK:
+        raise ProtocolError(f"client_time 超出 uint32：{client_time}")
+    return HEARTBEAT.pack(client_time)
+
+
+# ---------------------------------------------------------------- 认证
+
+
+def pack_auth(token: str, version: int = 1) -> bytes:
+    """打包 `C_AUTH`：version uint8 + token 变长 ASCII。"""
+    try:
+        raw = token.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ProtocolError(f"token 必须是 ASCII：{exc}") from exc
+    if not TOKEN_MIN <= len(raw) <= TOKEN_MAX:
+        raise ProtocolError(f"token 长度需为 {TOKEN_MIN}~{TOKEN_MAX} 字节：{len(raw)}")
+    if not 0 <= version <= 0xFF:
+        raise ProtocolError(f"version 超出 uint8：{version}")
+    return AUTH_HEADER.pack(version) + raw
+
+
+def unpack_auth(payload: bytes) -> tuple[int, str]:
+    """解析 `C_AUTH`，返回 (version, token)。"""
+    if len(payload) < AUTH_HEADER.size + TOKEN_MIN:
+        raise ProtocolError(f"C_AUTH 载荷过短：{len(payload)} 字节")
+    version = AUTH_HEADER.unpack(payload[: AUTH_HEADER.size])[0]
+    raw = payload[AUTH_HEADER.size :]
+    if len(raw) > TOKEN_MAX:
+        raise ProtocolError(f"token 超长：{len(raw)} > {TOKEN_MAX}")
+    try:
+        token = raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError(f"token 不是 ASCII：{exc}") from exc
+    return version, token
+
+
+def pack_auth_ok(player_id: int, nickname: str) -> bytes:
+    """打包 `S_AUTH_OK`：player_id uint16 + nickname_len uint8 + nickname。"""
+    raw = nickname.encode("utf-8")
+    if not NICKNAME_MIN <= len(raw) <= NICKNAME_MAX:
+        raise ProtocolError(f"nickname 长度需为 {NICKNAME_MIN}~{NICKNAME_MAX} 字节")
+    if not 0 <= player_id <= 0xFFFF:
+        raise ProtocolError(f"player_id 超出 uint16：{player_id}")
+    return AUTH_OK_HEADER.pack(player_id, len(raw)) + raw
+
+
+def unpack_auth_ok(payload: bytes) -> tuple[int, str]:
+    if len(payload) < AUTH_OK_HEADER.size:
+        raise ProtocolError(f"S_AUTH_OK 载荷过短：{len(payload)} 字节")
+    player_id, length = AUTH_OK_HEADER.unpack(payload[: AUTH_OK_HEADER.size])
+    raw = payload[AUTH_OK_HEADER.size :]
+    if len(raw) != length:
+        raise ProtocolError(f"nickname 长度不符：声明 {length}，实际 {len(raw)}")
+    return player_id, raw.decode("utf-8", errors="replace")
+
+
+def pack_auth_fail(code: int = ERR_AUTH_FAILED) -> bytes:
+    if not 0 <= code <= 0xFF:
+        raise ProtocolError(f"code 超出 uint8：{code}")
+    return AUTH_FAIL.pack(code)
+
+
+def unpack_auth_fail(payload: bytes) -> int:
+    _require_size(payload, AUTH_FAIL, "S_AUTH_FAIL")
+    return AUTH_FAIL.unpack(payload)[0]
+
+
+def unpack_heartbeat(payload: bytes) -> int:
+    """解析 C_HEARTBEAT 载荷，返回 client_time。"""
+    _require_size(payload, HEARTBEAT, "C_HEARTBEAT")
+    return HEARTBEAT.unpack(payload)[0]
+
+
+def pack_heartbeat_ack(client_time: int, server_time: int) -> bytes:
+    for name, value in (("client_time", client_time), ("server_time", server_time)):
+        if not 0 <= value <= _TIME_MASK:
+            raise ProtocolError(f"{name} 超出 uint32：{value}")
+    return HEARTBEAT_ACK.pack(client_time, server_time)
+
+
+def unpack_heartbeat_ack(payload: bytes) -> tuple[int, int]:
+    """解析 S_HEARTBEAT_ACK 载荷，返回 (client_time, server_time)。"""
+    _require_size(payload, HEARTBEAT_ACK, "S_HEARTBEAT_ACK")
+    return HEARTBEAT_ACK.unpack(payload)

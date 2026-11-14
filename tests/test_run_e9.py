@@ -1,0 +1,217 @@
+"""E9 运行器（tools/run_e9.py）的单元测试。"""
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from tools.run_e9 import (
+    DEFAULT_LEVELS,
+    build_bot_cmd,
+    build_server_cmd,
+    count_rows,
+    format_percent,
+    parse_encoders,
+    parse_levels,
+    scenario_name,
+)
+
+
+class FakeArgs:
+    port = 9527
+    clients = 4
+    duration = 180.0
+    ramp = 4.0
+    seed = 1
+    bot_seed = 99
+    metrics = Path("data/server_metrics.csv")
+
+
+class NamingTest(unittest.TestCase):
+    def test_scenario_name_pattern(self):
+        # tools/plot.py 靠 `-rN` 后缀解析轮次，命名不能随意改
+        self.assertEqual(scenario_name("E9", 30, 200, 2), "E9-e30-b200-r2")
+        self.assertEqual(scenario_name("E9", 250, 2000, 1), "E9-e250-b2000-r1")
+
+    def test_scenario_name_with_encoder(self):
+        # E1：编码段在档位之后、轮次之前
+        self.assertEqual(
+            scenario_name("E1", 30, 200, 1, "json"), "E1-e30-b200-json-r1"
+        )
+        self.assertEqual(
+            scenario_name("E1", 100, 800, 2, "binary_fast"), "E1-e100-b800-binary_fast-r2"
+        )
+
+    def test_scenario_name_without_encoder_is_unchanged(self):
+        # E9 的命名必须一字不差 —— 已完成的实验记录引用着它
+        self.assertEqual(scenario_name("E9", 30, 200, 1, ""), "E9-e30-b200-r1")
+        self.assertEqual(scenario_name("E9", 30, 200, 1), "E9-e30-b200-r1")
+
+    def test_run_suffix_stays_last(self):
+        # plot.py 用 `-r(\d+)$` 匹配轮次；编码段不能跑到它后面去
+        for encoder in ("json", "binary_fast", "binary"):
+            name = scenario_name("E1", 30, 200, 3, encoder)
+            with self.subTest(encoder=encoder):
+                self.assertTrue(name.endswith("-r3"), name)
+
+    def test_binary_fast_underscore_does_not_break_parsing(self):
+        # 编码名里带下划线，别把 `-e`/`-b` 的解析搞乱
+        name = scenario_name("E1", 250, 2000, 2, "binary_fast")
+        self.assertEqual(name, "E1-e250-b2000-binary_fast-r2")
+        self.assertEqual(name.split("-e")[1].split("-")[0], "250")
+
+    def test_default_levels_are_ascending(self):
+        # 横轴顺序靠实体总数排序，档位表本身也应当是递增的
+        totals = [e + b for e, b in DEFAULT_LEVELS]
+        self.assertEqual(totals, sorted(totals))
+
+    def test_default_levels_include_the_documented_six(self):
+        # 03-实验清单 原本定的 6 档必须还在（追加不等于替换）
+        documented = {(10, 50), (20, 100), (30, 200), (50, 400), (80, 600), (100, 800)}
+        self.assertTrue(documented.issubset(set(DEFAULT_LEVELS)))
+
+    def test_enemy_count_fits_uint8(self):
+        # enemy_count 在快照头里是 uint8，超过 255 会在编码时炸
+        self.assertTrue(all(enemies <= 0xFF for enemies, _ in DEFAULT_LEVELS))
+
+
+class ParseLevelsTest(unittest.TestCase):
+    def test_single(self):
+        self.assertEqual(parse_levels("30/200"), ((30, 200),))
+
+    def test_multiple_with_spaces(self):
+        self.assertEqual(
+            parse_levels(" 30/200 , 100/800 "), ((30, 200), (100, 800))
+        )
+
+    def test_ignores_empty_chunks(self):
+        self.assertEqual(parse_levels("30/200,,"), ((30, 200),))
+
+    def test_missing_slash_is_rejected(self):
+        # 写错格式必须立刻炸，不能默默跑出一个错误档位
+        with self.assertRaises(ValueError):
+            parse_levels("30-200")
+
+    def test_non_numeric_is_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_levels("三十/200")
+
+
+class CommandTest(unittest.TestCase):
+    def test_server_cmd_carries_e9_controls(self):
+        cmd = build_server_cmd(FakeArgs(), 30, 200, "E9-e30-b200-r1")
+
+        self.assertIn("-m", cmd)
+        self.assertIn("server.main", cmd)
+        for flag, value in (
+            ("--enemies", "30"),
+            ("--bullets", "200"),
+            ("--scenario", "E9-e30-b200-r1"),
+            ("--seed", "1"),
+        ):
+            self.assertIn(flag, cmd, flag)
+            self.assertEqual(cmd[cmd.index(flag) + 1], value, flag)
+
+    def test_bot_cmd_carries_control_variables(self):
+        cmd = build_bot_cmd(FakeArgs(), "E9-e30-b200-r1", Path("out.json"))
+
+        for flag, value in (
+            ("--clients", "4"),
+            ("--duration", "180.0"),
+            ("--ramp", "4.0"),
+            ("--seed", "99"),
+        ):
+            self.assertIn(flag, cmd, flag)
+            self.assertEqual(cmd[cmd.index(flag) + 1], value, flag)
+
+    def test_bot_cmd_writes_clean_json(self):
+        # 用 --out 让机器人写干净 JSON，而不是从日志里抠
+        cmd = build_bot_cmd(FakeArgs(), "x", Path("data/runs/x.json"))
+        self.assertEqual(cmd[cmd.index("--out") + 1], str(Path("data/runs/x.json")))
+
+    def test_commands_use_the_same_interpreter(self):
+        # 必须用当前解释器（venv），否则会跑到系统 Python 上去
+        import sys
+
+        self.assertEqual(build_server_cmd(FakeArgs(), 1, 1, "x")[0], sys.executable)
+        self.assertEqual(build_bot_cmd(FakeArgs(), "x", Path("o"))[0], sys.executable)
+
+
+class ParseEncodersTest(unittest.TestCase):
+    def test_empty_means_unspecified(self):
+        # 留空 = 不指定编码；场景名里也不带编码段（E9 的命名保持原样）
+        self.assertEqual(parse_encoders(""), ())
+        self.assertEqual(parse_encoders("  ,  "), ())
+
+    def test_single_and_multiple(self):
+        self.assertEqual(parse_encoders("json"), ("json",))
+        self.assertEqual(
+            parse_encoders("binary, binary_fast ,json"),
+            ("binary", "binary_fast", "json"),
+        )
+
+    def test_unknown_encoder_is_rejected(self):
+        # `--encoders jsno` 这种手误必须当场炸，否则会白跑一轮还把数据标错编码
+        with self.assertRaises(ValueError):
+            parse_encoders("jsno")
+
+    def test_all_three_variants_are_available(self):
+        # 拍板要三个变体（binary / binary_fast / json），别只剩两个
+        self.assertEqual(
+            parse_encoders("binary,binary_fast,json"), ("binary", "binary_fast", "json")
+        )
+
+
+class EncoderCommandTest(unittest.TestCase):
+    def test_encoder_flag_passed_through(self):
+        cmd = build_server_cmd(FakeArgs(), 30, 200, "E1-e30-b200-json-r1", "json")
+        self.assertIn("--encoder", cmd)
+        self.assertEqual(cmd[cmd.index("--encoder") + 1], "json")
+
+    def test_no_encoder_flag_when_unspecified(self):
+        # E9 的命令行不能多出 --encoder 参数
+        cmd = build_server_cmd(FakeArgs(), 30, 200, "E9-e30-b200-r1")
+        self.assertNotIn("--encoder", cmd)
+
+
+class CountRowsTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "m.csv"
+
+    def test_counts_only_the_matching_scenario(self):
+        self.path.write_text(
+            "timestamp,t_mono,scenario_id,enemies\n"
+            "2026-10-25T00:00:00,1.0,E9-e30-b200-r1,30\n"
+            "2026-10-25T00:00:01,2.0,E9-e30-b200-r1,30\n"
+            "2026-10-25T00:00:02,3.0,E9-e100-b800-r1,100\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(count_rows(self.path, "E9-e30-b200-r1"), 2)
+        self.assertEqual(count_rows(self.path, "E9-e100-b800-r1"), 1)
+
+    def test_does_not_confuse_r1_with_r10(self):
+        # 前缀相同但轮次不同：不能把 r10 算进 r1
+        self.path.write_text(
+            "scenario_id,enemies\n"
+            "E9-e30-b200-r1,30\n"
+            "E9-e30-b200-r10,30\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(count_rows(self.path, "E9-e30-b200-r1"), 1)
+
+    def test_missing_file_is_zero(self):
+        self.assertEqual(count_rows(Path(self._tmp.name) / "nope.csv", "x"), 0)
+
+
+class FormatTest(unittest.TestCase):
+    def test_percent(self):
+        self.assertEqual(format_percent(5.43), "5.4%")
+
+    def test_none_is_na(self):
+        # 没装 psutil 时整机 CPU 采不到，不能显示成 0%
+        self.assertEqual(format_percent(None), "n/a")
+
+
+if __name__ == "__main__":
+    unittest.main()
