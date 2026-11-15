@@ -6,6 +6,7 @@
 
 Django==5.2.18                 # Web 框架
 djangorestframework==3.18.3    # /api/v2/runs/ 只读接口
+django-filter==26.2            # 对局列表过滤（level / score / 日期）
 python-dotenv==1.2.4           # 本地从 .env 读配置
 PyMySQL==1.2.3                 # MySQL 驱动（Windows 免编译）
 cryptography==50.0.2           # MySQL 8 caching_sha2_password 认证

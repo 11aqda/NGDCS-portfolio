@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import django_filters
 from django.db import transaction
 from django.shortcuts import get_object_or_404
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
@@ -49,6 +51,30 @@ class RunPagination(PageNumberPagination):
     max_page_size = 100
 
 
+class ScoreRecordFilter(django_filters.FilterSet):
+    """对局列表的过滤条件：等级、分数区间、创建日期区间。"""
+
+    level = django_filters.NumberFilter(field_name="level")
+    score_min = django_filters.NumberFilter(field_name="score", lookup_expr="gte")
+    score_max = django_filters.NumberFilter(field_name="score", lookup_expr="lte")
+    created_after = django_filters.DateFilter(
+        field_name="created_at", lookup_expr="date__gte"
+    )
+    created_before = django_filters.DateFilter(
+        field_name="created_at", lookup_expr="date__lte"
+    )
+
+    class Meta:
+        model = ScoreRecord
+        fields = [
+            "level",
+            "score_min",
+            "score_max",
+            "created_after",
+            "created_before",
+        ]
+
+
 class ScoreRecordViewSet(viewsets.ReadOnlyModelViewSet):
     """`/api/v2/runs/` 与 `/api/v2/runs/<id>/`。"""
 
@@ -56,7 +82,12 @@ class ScoreRecordViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ScoreRecordSerializer
     permission_classes = [IsAdminUser]
     pagination_class = RunPagination
-    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    filter_backends = [
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    ]
+    filterset_class = ScoreRecordFilter
     search_fields = ["user__username"]
     ordering_fields = ["score", "level", "kills", "created_at"]
     ordering = ["-score", "-created_at"]

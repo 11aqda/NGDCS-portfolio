@@ -28,9 +28,10 @@
 
 ## 项目二：Django 监控与数据分析平台
 
-- **只读看板**：管理员登录、对局记录分页与按玩家名搜索、Top 10、最近 7 天趋势
+- **看板**：管理员登录、对局记录分页与按玩家名搜索、Top 10、最近 7 天趋势
 - **实时指标**：在线人数、tick P95、下行带宽、快照大小、CPU；优先读 Redis（TTL 10 s），读不到回退 CSV 最后一行
-- **只读 API**：`/api/v2/runs/`，DRF 序列化 + 分页 + 搜索 + 排序 + 管理员权限
+- **对局复核备注**：管理员可给对局写备注（≤200 字），列表 / 新建 / 删除，只能删自己的
+- **API**：`/api/v2/runs/` 分页 + 搜索 + 排序 + 过滤；认证支持 Session 与 `Authorization: Bearer <token>`
 
 ![看板总览](docs/screenshots/08-dashboard.png)
 
@@ -51,8 +52,8 @@
 | 实时服务端 | Python 3.13 + asyncio | 单线程事件循环，20 Hz tick |
 | 协议 | 自定义二进制 | 12 字节帧头，解决粘包 / 半包 |
 | 客户端 | pygame | 720×960，非阻塞 socket + 插值 |
-| Web | Django 5.2 + DRF | JSON 接口 + 一个只读资源 |
-| 数据库 | MySQL 8 | `auth_user` / `auth_token` / `score_record` |
+| Web | Django 5.2 + DRF | 看板 + API（Session / Bearer token） |
+| 数据库 | MySQL 8 | `auth_user` / `auth_token` / `score_record` / `run_note` |
 | 缓存 | Redis | 排行榜 ZSET + 实时指标 Hash |
 | 部署 | Docker Compose + nginx + gunicorn | 可选，见下文 |
 
@@ -113,7 +114,7 @@ copy .env.example .env
 
 ```powershell
 $env:DEMO_PASSWORD = "自己设一个"
-python manage.py seed_demo
+.\.venv\Scripts\python.exe manage.py seed_demo
 ```
 
 生成 `demo` 管理员（staff）+ 5 个 `demo_` 玩家 + 35 条对局，重复执行会重建而不是累加。
@@ -141,9 +142,9 @@ python manage.py seed_demo
 
 ```text
 主测试     491 passed
-Django     52 passed
+Django     79 passed
 黄金基线   SHA256 7860bdb9…
-实验回归   24/24
+采集回归   24/24
 ```
 
 ---
@@ -155,12 +156,43 @@ Django     52 passed
 | POST | `/api/auth/register` | 公开 | 注册并发 token |
 | POST | `/api/auth/login` | 公开 | 登录 |
 | GET | `/api/leaderboard` | 公开 | 排行榜（Redis 优先，MySQL 兜底） |
-| GET | `/api/v2/runs/` | 管理员 | 对局记录：分页 / `search` / `ordering` |
+| GET | `/api/v2/runs/` | 管理员 | 对局记录：分页 / 搜索 / 排序 / 过滤 |
 | GET | `/api/v2/runs/<id>/` | 管理员 | 单条对局 |
+| GET | `/api/v2/runs/<id>/notes/` | 管理员 | 该对局的复核备注 |
+| POST | `/api/v2/runs/<id>/notes/` | 管理员 | 新建备注（201，author 取当前用户） |
+| DELETE | `/api/v2/runs/<id>/notes/<note_id>/` | 管理员 | 删除自己的备注（204；删别人的 403） |
+
+### 认证
+
+- 浏览器看板：Django Session
+- 脚本 / 客户端：`Authorization: Bearer <token>`，查 `auth_token` 表
+- 未认证 → **401**（`WWW-Authenticate: Bearer`）；已认证但不是 staff → **403**
+
+### 过滤
 
 ```text
-GET /api/v2/runs/?page=2&page_size=50&search=demo&ordering=-score
+GET /api/v2/runs/?level=2
+GET /api/v2/runs/?score_min=500&score_max=1300
+GET /api/v2/runs/?created_after=2026-11-01&created_before=2026-11-15
+GET /api/v2/runs/?level=2&search=demo&ordering=-score&page=2
 ```
+
+### 索引与 EXPLAIN
+
+`score_record.created_at` 的索引是**手写迁移**（`dashboard/0002` 的 `RunSQL`），
+没有改 `accounts/models.py`，所以 Django 迁移状态里看不到它。
+
+在 5 万行临时库（`ngdcs_explain_tmp`，跑完已删除）上对比：
+
+```text
+查询：WHERE created_at >= '2026-12-20' ORDER BY created_at LIMIT 20
+
+无索引：type=ALL   rows=50000  Extra=Using where; Using filesort
+有索引：type=range key=idx_score_created_at rows≈2480  Extra=Using index condition
+```
+
+> 本地 `score_record` 只有几十行，MySQL 会直接全表扫，**体现不出索引效果**；
+> 所以用临时库造数据。接口层另有 `assertNumQueries` 锁住列表页的查询数。
 
 ---
 
@@ -171,8 +203,8 @@ protocol/    帧、快照编解码、编码器（binary / binary_fast / json）
 server/      asyncio 服务端、实体、运动学、CSV 指标、Redis 实时指标
 client/      pygame 客户端（渲染 / 插值 / 输入 / 心跳）
 bot/         压测机器人
-accounts/    用户、token、成绩、排行榜、DRF 只读接口、seed_demo
-dashboard/   看板视图与模板
+accounts/    用户、token、成绩、排行榜、DRF 接口、Bearer 认证、seed_demo
+dashboard/   看板视图与模板、RunNote 模型与迁移（含手写索引）
 webapp/      Django 配置与路由
 tools/       压测、出图、回归检查、录屏
 tests/       主测试与黄金基线
