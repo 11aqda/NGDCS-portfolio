@@ -1,4 +1,4 @@
-"""看板实时指标的取数逻辑：Redis 优先，CSV 回退。"""
+"""看板取数、设置与对局复核备注的测试。"""
 
 from __future__ import annotations
 
@@ -9,9 +9,15 @@ from pathlib import Path
 from unittest import mock
 
 from django.conf import settings
+from django.contrib.auth.models import User
+from django.db import connection
 from django.test import SimpleTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
+from rest_framework.test import APITestCase
 
+from accounts.models import ScoreRecord
 from dashboard import views
+from dashboard.models import RunNote
 
 
 def stamp(offset_seconds: int = 0) -> str:
@@ -131,7 +137,7 @@ class LatestMetricsTest(SimpleTestCase):
 
 class SettingsTest(SimpleTestCase):
     def test_metrics_csv_defaults_to_workspace_data(self):
-        # 没设 NGDCS_METRICS_CSV 时，默认读本工作区 data/（14 ）
+        # 没设 NGDCS_METRICS_CSV 时，默认读本工作区 data/
         self.assertEqual(
             settings.METRICS_CSV,
             settings.BASE_DIR / "data" / "server_metrics.csv",
@@ -140,3 +146,133 @@ class SettingsTest(SimpleTestCase):
     def test_live_metrics_key_and_ttl(self):
         self.assertEqual(settings.LIVE_METRICS_KEY, "ngdcs:metrics:live")
         self.assertEqual(settings.LIVE_METRICS_TTL, 10)
+
+
+class RunNoteApiTest(APITestCase):
+    """对局复核备注：权限、校验、对象级删除与 N+1。"""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.admin = User.objects.create_user("admin", password="x", is_staff=True)
+        cls.admin2 = User.objects.create_user("admin2", password="x", is_staff=True)
+        cls.alice = User.objects.create_user("alice", password="x")
+        cls.run_record = ScoreRecord.objects.create(
+            user=cls.alice, score=100, level=1, kills=10
+        )
+        cls.other_run = ScoreRecord.objects.create(
+            user=cls.alice, score=200, level=2, kills=20
+        )
+
+    def notes_url(self, run=None):
+        return f"/api/v2/runs/{(run or self.run_record).id}/notes/"
+
+    def note_url(self, note, run=None):
+        return f"{self.notes_url(run)}{note.id}/"
+
+    def test_anonymous_denied(self):
+        resp = self.client.get(self.notes_url())
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_non_staff_denied(self):
+        self.client.force_authenticate(self.alice)
+        self.assertIn(self.client.get(self.notes_url()).status_code, (401, 403))
+        self.assertIn(
+            self.client.post(
+                self.notes_url(), {"content": "x"}, format="json"
+            ).status_code,
+            (401, 403),
+        )
+
+    def test_admin_lists_notes_of_one_run(self):
+        RunNote.objects.create(run=self.run_record, author=self.admin, content="a")
+        RunNote.objects.create(run=self.run_record, author=self.admin2, content="b")
+        RunNote.objects.create(run=self.other_run, author=self.admin, content="c")
+
+        self.client.force_authenticate(self.admin)
+        resp = self.client.get(self.notes_url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([row["content"] for row in resp.data], ["b", "a"])
+
+    def test_create_note(self):
+        self.client.force_authenticate(self.admin)
+        resp = self.client.post(
+            self.notes_url(), {"content": "  已复核  "}, format="json"
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["content"], "已复核")
+        self.assertEqual(resp.data["author"], "admin")
+        note = RunNote.objects.get(id=resp.data["id"])
+        self.assertEqual(note.author, self.admin)
+        self.assertEqual(note.run, self.run_record)
+
+    def test_create_ignores_client_author(self):
+        self.client.force_authenticate(self.admin)
+        resp = self.client.post(
+            self.notes_url(),
+            {"content": "x", "author": "admin2"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["author"], "admin")
+
+    def test_create_rejects_blank(self):
+        self.client.force_authenticate(self.admin)
+        resp = self.client.post(
+            self.notes_url(), {"content": "   "}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_create_rejects_too_long(self):
+        self.client.force_authenticate(self.admin)
+        resp = self.client.post(
+            self.notes_url(), {"content": "x" * 201}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_create_404_when_run_missing(self):
+        self.client.force_authenticate(self.admin)
+        resp = self.client.post(
+            "/api/v2/runs/999999/notes/", {"content": "x"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_delete_own_note(self):
+        note = RunNote.objects.create(run=self.run_record, author=self.admin, content="x")
+        self.client.force_authenticate(self.admin)
+        resp = self.client.delete(self.note_url(note))
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(RunNote.objects.filter(id=note.id).exists())
+
+    def test_delete_others_note_forbidden(self):
+        note = RunNote.objects.create(run=self.run_record, author=self.admin2, content="x")
+        self.client.force_authenticate(self.admin)
+        resp = self.client.delete(self.note_url(note))
+        self.assertEqual(resp.status_code, 403)
+        self.assertTrue(RunNote.objects.filter(id=note.id).exists())
+
+    def test_delete_404_when_note_not_in_run(self):
+        note = RunNote.objects.create(
+            run=self.other_run, author=self.admin, content="x"
+        )
+        self.client.force_authenticate(self.admin)
+        resp = self.client.delete(self.note_url(note, run=self.run_record))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_list_query_count_is_constant(self):
+        for i in range(5):
+            RunNote.objects.create(
+                run=self.run_record, author=self.admin, content=f"note-{i}"
+            )
+        self.client.force_authenticate(self.admin)
+        with CaptureQueriesContext(connection) as ctx:
+            resp = self.client.get(self.notes_url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 5)
+        # 1 次查 run + 1 次查备注（select_related 把 author 带出来）
+        self.assertLessEqual(len(ctx.captured_queries), 3)
+        self.assertFalse(
+            any(
+                "auth_user" in query["sql"] and "JOIN" not in query["sql"]
+                for query in ctx.captured_queries
+            )
+        )
