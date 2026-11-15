@@ -69,6 +69,7 @@ LOGOUT_REDIRECT_URL = "/accounts/login/"
 # DRF 默认口径：以后新增 ViewSet 忘写权限时，默认就是"仅管理员"，而不是裸奔。
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
+        "accounts.authentication.AuthTokenAuthentication",
         "rest_framework.authentication.SessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
